@@ -11,23 +11,153 @@
      ${MD_JS_ONINIT}
      (function($, undefined) {
          var socket = new WebSocket("ws://${WS_HOST}:${WS_PORT}");
+         var previewUuid = "${MD_UUID}";
+         var body = null;
+         var lastRaw = null;
+         var saveTimer = null;
+         var scrollKey = "mdpm-scroll-" + previewUuid;
+
+         function currentBody() {
+             if (!body) body = document.getElementById("markdown-body");
+             return body;
+         }
+
+         function readSavedScroll() {
+             try {
+                 var value = sessionStorage.getItem(scrollKey);
+                 if (value === null) return null;
+                 var y = parseInt(value, 10);
+                 return isNaN(y) ? null : y;
+             } catch (e) {
+                 return null;
+             }
+         }
+
+         function saveScroll() {
+             try {
+                 sessionStorage.setItem(scrollKey, String(window.scrollY));
+             } catch (e) {}
+         }
+
+         function scheduleSaveScroll() {
+             if (saveTimer !== null) return;
+             saveTimer = window.setTimeout(function() {
+                 saveTimer = null;
+                 saveScroll();
+             }, 200);
+         }
+
+         function canonical(text) {
+             return (text || "")
+                 .normalize("NFKD")
+                 .replace(/[\u0300-\u036f]/g, "")
+                 .toLowerCase()
+                 .replace(/[^\p{L}\p{N}]+/gu, " ")
+                 .trim();
+         }
+
+         function scrollToHeading(message) {
+             var headings = Array.prototype.slice.call(
+                 currentBody().querySelectorAll("h1,h2,h3,h4,h5,h6"));
+             var wanted = canonical(message.heading);
+             var target = null;
+
+             if (wanted) {
+                 target = headings.filter(function(h) {
+                     return canonical(h.textContent) === wanted;
+                 })[0] || null;
+                 if (!target) {
+                     target = headings.filter(function(h) {
+                         var text = canonical(h.textContent);
+                         return text.indexOf(wanted) !== -1 ||
+                             wanted.indexOf(text) !== -1;
+                     })[0] || null;
+                 }
+             }
+
+             if (!target && message.index > 0) {
+                 target = headings[message.index - 1] || null;
+             }
+
+             if (target) {
+                 target.scrollIntoView({ behavior: "smooth", block: "start" });
+             } else if (typeof message.percent === "number") {
+                 var max = document.documentElement.scrollHeight - window.innerHeight;
+                 window.scrollTo({
+                     top: Math.max(0, max * message.percent / 100),
+                     behavior: "smooth"
+                 });
+             }
+         }
+
+         function runOnUpdate() {
+             return ${MD_JS_ONUPDATE};
+         }
+
+         function restoreScrollAfterUpdate(targetY) {
+             window.scrollTo(0, targetY);
+             var pending = null;
+             try {
+                 pending = runOnUpdate();
+             } catch (e) {
+                 console.log(e);
+             }
+             if (pending && typeof pending.then === "function") {
+                 pending.then(function() {
+                     window.scrollTo(0, targetY);
+                 }).catch(function(e) {
+                     console.log(e);
+                 });
+             } else {
+                 window.setTimeout(function() {
+                     window.scrollTo(0, targetY);
+                 }, 100);
+             }
+         }
+
+         function updateContent(raw) {
+             if (raw === lastRaw) return;
+
+             var firstContent = (lastRaw === null);
+             lastRaw = raw;
+
+             var targetY = window.scrollY;
+             if (firstContent) {
+                 var saved = readSavedScroll();
+                 if (saved !== null) targetY = saved;
+             }
+
+             var container = document.createElement("div");
+             container.innerHTML = raw;
+             var content = container.querySelector("#content");
+             currentBody().innerHTML = content ? content.innerHTML : raw;
+             restoreScrollAfterUpdate(targetY);
+         }
+
+         window.addEventListener("scroll", scheduleSaveScroll, { passive: true });
+
          socket.onopen = function() {
              console.log("Connection established.");
-             socket.send("MDPM-Register-UUID: ${MD_UUID}");
+             socket.send("MDPM-Register-UUID: " + previewUuid);
          };
          socket.onclose = function(event) {
              if (event.wasClean) {
-                 console.log('Connection closed gracefully.');
+                 console.log("Connection closed gracefully.");
              } else {
-                 console.log('Connection terminated.');
+                 console.log("Connection terminated.");
              }
-             console.log('Code: ' + event.code + ' reason: ' + event.reason);
+             console.log("Code: " + event.code + " reason: " + event.reason);
          };
          socket.onmessage = function(event) {
-             $("#markdown-body").html($(event.data).find("#content").html()).trigger('mdContentChange');
-             var scroll = $(document).height() * ($(event.data).find("#position-percentage").html() / 100);
-             $("html, body").animate({ scrollTop: scroll }, 600);
-             ${MD_JS_ONUPDATE}
+             if (event.data.indexOf("MDPM-SCROLL:") === 0) {
+                 try {
+                     scrollToHeading(JSON.parse(event.data.slice(12)));
+                 } catch (e) {
+                     console.log("Invalid scroll command", e);
+                 }
+                 return;
+             }
+             updateContent(event.data);
          };
          socket.onerror = function(error) {
              console.log("Error: " + error.message);

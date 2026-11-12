@@ -31,6 +31,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'websocket)
 (require 'markdown-mode)
 (require 'web-server)
@@ -89,9 +90,20 @@
   :type 'string)
 
 (defcustom markdown-preview-script-onupdate ""
-  "Markdown preview javascript which runs on update preview."
+  "Markdown preview javascript expression evaluated on update.
+The expression is the return value of the update function.  If it
+returns a Promise, scrolling is restored after it resolves."
   :group 'markdown-preview
   :type 'string)
+
+(defcustom markdown-preview-command nil
+  "Command used to render the preview.
+If nil, `markdown-command' is used.  This command should produce an
+HTML fragment (no --standalone) because its output is inserted into
+the preview page."
+  :group 'markdown-preview
+  :type '(choice (const :tag "Use `markdown-command'" nil)
+                 (repeat string)))
 
 (defvar markdown-preview-javascript '()
   "List of client javascript libs for preview.")
@@ -127,6 +139,9 @@
 
 (defvar markdown-preview--preview-buffers (make-hash-table :test 'equal)
   "Preview buffers hashtable. UUID -> buffer name.")
+
+(defvar-local markdown-preview--last-source-tick nil
+  "Last modification tick sent to the preview for this buffer.")
 
 (defun markdown-preview--stop-idle-timer ()
   "Stop the `markdown-preview' idle timer."
@@ -304,41 +319,32 @@
                        (setq markdown-preview--local-client nil))))))
 
 (defun markdown-preview--send-preview (preview-uuid)
-  "Send the `markdown-preview' with PREVIEW-UUID preview to clients."
+  "Send the `markdown-preview' with PREVIEW-UUID preview to clients.
+Skip the update when the buffer has not changed since the last send."
   (when (bound-and-true-p markdown-preview-mode)
-    (markdown-preview--send-preview-to markdown-preview--local-client preview-uuid)))
+    (let ((current-tick (buffer-chars-modified-tick)))
+      (unless (equal current-tick markdown-preview--last-source-tick)
+        (markdown-preview--send-preview-to markdown-preview--local-client preview-uuid)
+        (setq markdown-preview--last-source-tick current-tick)))))
 
 (defun markdown-preview--send-preview-to (websocket preview-uuid)
   "Send the `markdown-preview' with PREVIEW-UUID to a specific WEBSOCKET."
-  (let ((mark-position-percent
-         (number-to-string
-          (truncate
-           (* 100
-              (/
-               (float (-  (line-number-at-pos) (/ (count-screen-lines (window-start) (point)) 2)))
-               (count-lines (point-min) (point-max))))))))
+  (let ((md-buffer (gethash preview-uuid markdown-preview--preview-buffers))
+        (markdown-command (or markdown-preview-command markdown-command)))
+    (when md-buffer
+      (with-current-buffer md-buffer
+        (markdown markdown-output-buffer-name)))
 
-    (let ((md-buffer (gethash preview-uuid markdown-preview--preview-buffers)))
-      (when md-buffer
-        (with-current-buffer md-buffer
-
-          (markdown markdown-output-buffer-name))))
-
-    (with-current-buffer markdown-output-buffer-name ;; get-buffer
+    (with-current-buffer markdown-output-buffer-name
       (websocket-send-text websocket
                            (concat
-                            "<div>"
-                            "<span id='position-percentage'>"
-                            mark-position-percent
-                            "</span>"
                             "<div id='content'>"
                             (buffer-substring-no-properties (point-min) (point-max))
-                            "</div>"
-                            "</div>")
-                           ))))
+                            "</div>")))))
 
 (defun markdown-preview--start ()
   "Start `markdown-preview' mode."
+  (setq-local markdown-preview--last-source-tick nil)
   (setq-local markdown-preview--uuid (markdown-preview--random-uuid))
   (puthash markdown-preview--uuid (buffer-name) markdown-preview--preview-buffers)
   ;;  (gethash markdown-preview--uuid markdown-preview--preview-buffers)
@@ -399,6 +405,94 @@ URL `http://ergoemacs.org/emacs/elisp_generate_uuid.html'"
             (format "%x" (+ 8 (random 4)))
             (substring myStr 17 20)
             (substring myStr 20 32))))
+
+(defun markdown-preview--front-matter-end ()
+  "Return the end position of YAML/Toml front matter, or nil."
+  (save-excursion
+    (save-match-data
+      (goto-char (point-min))
+      (when (looking-at "\\(---\\|\\+\\+\\+\\)[ \t]*\r?$")
+        (let ((border (match-string-no-properties 1)))
+          (forward-line 1)
+          (when (re-search-forward
+                 (concat "^" (regexp-quote border) "[ \t]*\r?$") nil t)
+            (point)))))))
+
+(defun markdown-preview--headings-before (limit)
+  "Return Markdown headings before LIMIT as a list of (POSITION . TEXT).
+Fenced code blocks and YAML/Toml front matter are ignored."
+  (save-excursion
+    (save-match-data
+      (let ((front-matter-end (markdown-preview--front-matter-end))
+            (fence nil)
+            (headings nil))
+        (goto-char (point-min))
+        (while (and (<= (point) limit) (not (eobp)))
+          (let ((line-start (point)))
+            (cond
+             ((and fence
+                   (looking-at (concat "^[ \t]*"
+                                       (regexp-quote (substring fence 0 1))
+                                       "\\{3,\\}[ \t]*$")))
+              (setq fence nil))
+             (fence nil)
+             ((looking-at "^[ \t]*\\(`\\{3,\\}\\|~\\{3,\\}\\)")
+              (setq fence (match-string-no-properties 1)))
+             ((and (or (not front-matter-end) (>= line-start front-matter-end))
+                   (looking-at markdown-regex-header))
+              (push (cons line-start
+                          (or (match-string-no-properties 1)
+                              (match-string-no-properties 5)))
+                    headings)
+              (when (match-end 1)
+                (forward-line 1))))
+            (forward-line 1)))
+        (nreverse headings)))))
+
+(defun markdown-preview--nearest-heading ()
+  "Return (TEXT . INDEX) for the nearest Markdown heading before point.
+INDEX is 0 when no heading was found."
+  (let ((headings (markdown-preview--headings-before (point))))
+    (if headings
+        (let ((last (car (last headings))))
+          (cons (cdr last) (length headings)))
+      (cons nil 0))))
+
+(defun markdown-preview--point-percent ()
+  "Return point position as a percentage of the buffer."
+  (let ((total (line-number-at-pos (point-max)))
+        (line (line-number-at-pos (point))))
+    (if (> total 0)
+        (* 100.0 (/ (float line) total))
+      0.0)))
+
+;;;###autoload
+(defun markdown-preview-scroll-to-point ()
+  "Scroll the live preview to the Markdown section at point.
+The nearest preceding heading is used, with a heading index and a
+line percentage as fallbacks."
+  (interactive)
+  (unless (bound-and-true-p markdown-preview-mode)
+    (user-error "markdown-preview-mode is not active"))
+  (let* ((heading-info (markdown-preview--nearest-heading))
+         (payload (json-encode `((type . "scroll")
+                                 (heading . ,(or (car heading-info) ""))
+                                 (index . ,(cdr heading-info))
+                                 (percent . ,(markdown-preview--point-percent)))))
+         (command (concat "MDPM-SCROLL:" payload))
+         (local markdown-preview--local-client)
+         (remote (gethash markdown-preview--uuid
+                          markdown-preview--remote-clients)))
+    (cond
+     ((and remote (websocket-openp remote))
+      (if (and local (websocket-openp local))
+          (progn
+            (markdown-preview--send-preview markdown-preview--uuid)
+            (websocket-send-text local command))
+        (markdown-preview--send-preview-to remote markdown-preview--uuid)
+        (websocket-send-text remote command)))
+     (t
+      (user-error "No browser connected to the Markdown preview")))))
 
 ;;;###autoload
 (defun markdown-preview-open-browser ()
